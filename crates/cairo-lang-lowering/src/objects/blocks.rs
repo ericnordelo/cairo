@@ -16,10 +16,29 @@ impl<T> Blocks<T> {
         Blocks(vec![])
     }
     pub fn alloc(&mut self, block: T) -> BlockId {
-        let res = BlockId(self.0.len());
+        let id = BlockId(self.0.len());
         self.0.push(block);
-        res
+        id
     }
+    /// Allocate a new block ID. The block itself should be populated later.
+    pub fn alloc_empty(&mut self, create_empty: fn(id: BlockId) -> T) -> BlockId {
+        let id = BlockId(self.0.len());
+        println!("yg allocating block id: {}", id.0);
+        self.0.push(create_empty(id));
+        id
+    }
+    /// Sets an already-allocated block.
+    pub fn set_block(&mut self, id: BlockId, block: T) {
+        println!("yg setting block id: {}", id.0);
+        self.0[id.0] = block;
+    }
+
+    pub fn remove_unset_blocks(&mut self, is_set: fn(block: &T) -> bool) {
+        println!("yg removing unset blocks. Before: {}", self.0.len());
+        self.0.retain(|block| is_set(block));
+        println!("yg removing unset blocks. After: {}", self.0.len());
+    }
+
     pub fn iter(&self) -> BlocksIter<'_, T> {
         self.into_iter()
     }

@@ -59,7 +59,7 @@ pub fn lower_panics(
     let mut ctx = PanicLoweringContext {
         ctx,
         block_queue: VecDeque::from(lowered.blocks.0.clone()),
-        flat_blocks: FlatBlocks::new(),
+        flat_blocks: Immutable(FlatBlocks::new()),
         func_ok_variant,
         func_err_variant,
         panic_data_ty,
@@ -82,15 +82,38 @@ pub fn lower_panics(
     Ok(FlatLowered {
         diagnostics: Default::default(),
         variables: ctx.ctx.variables,
-        blocks: ctx.flat_blocks,
+        blocks: ctx.flat_blocks.get(),
         root: lowered.root,
     })
+}
+
+// TODO(yg): move to utils. (separate PR)
+/// A container for values that can only be deref'd immutably.
+struct Immutable<T>(T);
+
+impl<T> Immutable<T> {
+    pub fn new(value: T) -> Self {
+        Immutable(value)
+    }
+}
+
+impl<T> std::ops::Deref for Immutable<T> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+impl<T> Immutable<T> {
+    fn get(self) -> T {
+        self.0
+    }
 }
 
 struct PanicLoweringContext<'a> {
     ctx: LoweringContext<'a>,
     block_queue: VecDeque<StructuredBlock>,
-    flat_blocks: Blocks<FlatBlock>,
+    flat_blocks: Immutable<Blocks<FlatBlock>>,
     func_ok_variant: semantic::ConcreteVariant,
     func_err_variant: semantic::ConcreteVariant,
     panic_data_ty: semantic::TypeId,
@@ -100,9 +123,21 @@ impl<'a> PanicLoweringContext<'a> {
         self.ctx.db
     }
 
-    fn enqueue_block(&mut self, block: StructuredBlock) -> BlockId {
+    // TODO(yg): doc both
+    fn enqueue_empty(&mut self) -> BlockId {
+        let id = BlockId(self.flat_blocks.len() + self.block_queue.len());
+        println!("yg (panic) enqueuing empty block id {}", id.0);
+        let block = StructuredBlock::new(id);
         self.block_queue.push_back(block);
-        BlockId(self.flat_blocks.len() + self.block_queue.len())
+        id
+    }
+    fn set_block(&mut self, id: BlockId, block: StructuredBlock) {
+        println!(
+            "yg (panic) setting block id {}, block queue len: {}",
+            id.0,
+            self.block_queue.len()
+        );
+        self.block_queue[id.0 - self.flat_blocks.len()] = block;
     }
 }
 
@@ -191,23 +226,31 @@ impl<'a> PanicBlockLoweringContext<'a> {
             get_enum_concrete_variant(self.db().upcast(), "PanicResult", ty_arg, "Err");
 
         // Prepare Ok() match arm block.
-        let block_ok = self.ctx.enqueue_block(StructuredBlock {
+        let block_ok = self.ctx.enqueue_empty();
+        let block = StructuredBlock {
             initial_refs: self.current_refs.clone(),
             inputs: vec![inner_ok_value],
             statements: vec![],
             end: StructuredBlockEnd::Callsite(VarRemapping {
                 remapping: [(original_return_var, inner_ok_value)].into_iter().collect(),
             }),
-        });
+            id: block_ok,
+        };
+        self.ctx.set_block(block.id, block);
 
         // Prepare Err() match arm block.
         let data_var = self.new_var(VarRequest { ty: self.ctx.panic_data_ty, location });
-        let block_err = self.ctx.enqueue_block(StructuredBlock {
-            initial_refs: self.current_refs.clone(),
-            inputs: vec![data_var],
-            statements: vec![],
-            end: StructuredBlockEnd::Panic { refs: self.current_refs.clone(), data: data_var },
-        });
+        let block_err = self.ctx.enqueue_empty();
+        self.ctx.set_block(
+            block_err,
+            StructuredBlock {
+                initial_refs: self.current_refs.clone(),
+                inputs: vec![data_var],
+                statements: vec![],
+                end: StructuredBlockEnd::Panic { refs: self.current_refs.clone(), data: data_var },
+                id: block_err,
+            },
+        );
 
         // Emit the match statement.
         self.statements.push(Statement::MatchEnum(StatementMatchEnum {
@@ -224,6 +267,7 @@ impl<'a> PanicBlockLoweringContext<'a> {
     ) -> PanicLoweringContext<'a> {
         let end = match end {
             StructuredBlockEnd::Callsite(rets) => FlatBlockEnd::Callsite(rets),
+            StructuredBlockEnd::Goto { target, remapping } => FlatBlockEnd::Goto(target, remapping),
             StructuredBlockEnd::Panic { refs, data } => {
                 // Wrap with PanicResult::Err.
                 let ty = self.db().intern_type(semantic::TypeLongId::Concrete(
@@ -260,6 +304,7 @@ impl<'a> PanicBlockLoweringContext<'a> {
                 FlatBlockEnd::Return(chain!(refs, [output]).collect())
             }
             StructuredBlockEnd::Unreachable => FlatBlockEnd::Unreachable,
+            StructuredBlockEnd::NotSet => unreachable!(),
         };
         self.ctx.flat_blocks.alloc(FlatBlock { inputs, statements: self.statements, end });
         self.ctx

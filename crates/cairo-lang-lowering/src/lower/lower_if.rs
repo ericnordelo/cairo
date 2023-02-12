@@ -13,7 +13,7 @@ use super::{lower_expr, lowered_expr_to_block_scope_end};
 use crate::lower::context::VarRequest;
 use crate::lower::scope::merge_sealed;
 use crate::lower::{generators, lower_block};
-use crate::{Statement, StatementMatchEnum, StatementMatchExtern};
+use crate::{BlockId, Statement, StatementMatchEnum, StatementMatchExtern, StructuredBlock};
 
 #[allow(dead_code)]
 enum IfCondition {
@@ -54,6 +54,16 @@ pub fn lower_expr_if(
     }
 }
 
+// TODO(yg): doc, move to utils
+fn alloc_empty_block(ctx: &mut LoweringContext<'_>) -> BlockId {
+    ctx.blocks.alloc_empty(|id| StructuredBlock::new(id))
+}
+
+// TODO(yg): doc, move to utils, remove mut for scope?
+fn create_subscope(ctx: &mut LoweringContext<'_>, scope: &mut BlockBuilder) -> BlockBuilder {
+    scope.subscope_with_bound_refs(alloc_empty_block(ctx))
+}
+
 /// Lowers an expression of type [semantic::ExprIf], for the case of [IfCondition::BoolExpr].
 pub fn lower_expr_if_bool(
     ctx: &mut LoweringContext<'_>,
@@ -68,7 +78,7 @@ pub fn lower_expr_if_bool(
     let if_location = ctx.get_location(expr.stable_ptr.untyped());
 
     // Main block.
-    let mut subscope_main = scope.subscope_with_bound_refs();
+    let mut subscope_main = create_subscope(ctx, scope);
     let main_block =
         extract_matches!(&ctx.function_body.exprs[expr.if_block], semantic::Expr::Block);
     subscope_main.add_input(
@@ -79,7 +89,7 @@ pub fn lower_expr_if_bool(
         lower_block(ctx, subscope_main, main_block).map_err(LoweringFlowError::Failed)?;
 
     // Else block.
-    let subscope_else = scope.subscope_with_bound_refs();
+    let subscope_else = create_subscope(ctx, scope);
     let block_else =
         lower_optional_else_block(ctx, subscope_else, expr.else_block, if_location, unit_ty)
             .map_err(LoweringFlowError::Failed)?;
@@ -95,6 +105,12 @@ pub fn lower_expr_if_bool(
             (corelib::true_variant(semantic_db), merged.blocks[0]),
         ],
     }));
+
+    // After the merge, continue the rest of the code with a new subscope block.
+    if let Some(following_block) = merged.following_block {
+        scope.goto(ctx, following_block);
+    }
+
     merged.expr
 }
 
@@ -135,7 +151,7 @@ pub fn lower_expr_if_eq(
     let semantic_db = ctx.db.upcast();
 
     // Main block.
-    let subscope_main = scope.subscope_with_bound_refs();
+    let subscope_main = create_subscope(ctx, scope);
     let block_main = lower_block(
         ctx,
         subscope_main,
@@ -145,7 +161,7 @@ pub fn lower_expr_if_eq(
 
     // Else block.
     let non_zero_type = corelib::core_nonzero_ty(semantic_db, corelib::core_felt_ty(semantic_db));
-    let subscope_else = scope.subscope_with_bound_refs();
+    let subscope_else = create_subscope(ctx, scope);
     let block_else =
         lower_optional_else_block(ctx, subscope_else, expr.else_block, if_location, non_zero_type)
             .map_err(LoweringFlowError::Failed)?;
@@ -161,6 +177,12 @@ pub fn lower_expr_if_eq(
             (corelib::jump_nz_nonzero_variant(ctx.db.upcast()), merged.blocks[1]),
         ],
     }));
+
+    // After the merge, continue the rest of the code with a new subscope block.
+    if let Some(following_block) = merged.following_block {
+        scope.goto(ctx, following_block);
+    }
+
     merged.expr
 }
 

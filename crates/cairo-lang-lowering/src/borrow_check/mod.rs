@@ -113,6 +113,7 @@ impl<'a> BorrowChecker<'a> {
             }
             FlatBlockEnd::Return(vars) => Demand { vars: vars.iter().copied().collect() },
             FlatBlockEnd::Unreachable => Demand::default(),
+            FlatBlockEnd::NotSet => unreachable!(),
         };
         demand
     }

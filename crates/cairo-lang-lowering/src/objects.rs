@@ -71,6 +71,24 @@ pub struct StructuredBlock {
     pub statements: Vec<StructuredStatement>,
     /// Describes how this block ends: returns to the caller or exits the function.
     pub end: StructuredBlockEnd,
+    /// A preallocated block id to be used in the sealed block created from this structured block.
+    pub id: BlockId,
+}
+impl StructuredBlock {
+    // TODO(YG): rename to new_empty? doc anyway
+    pub fn new(block_id: BlockId) -> Self {
+        Self {
+            initial_refs: Default::default(),
+            inputs: Default::default(),
+            statements: Default::default(),
+            end: StructuredBlockEnd::NotSet,
+            id: block_id,
+        }
+    }
+    // TODO(yg): doc
+    pub fn is_set(&self) -> bool {
+        !matches!(self.end, StructuredBlockEnd::NotSet)
+    }
 }
 
 /// Remapping of lowered variable ids. Useful for convergence of branches.
@@ -95,12 +113,25 @@ impl DerefMut for VarRemapping {
 /// Describes what happens to the program flow at the end of a [`StructuredBlock`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum StructuredBlockEnd {
+    // TODO(yg): doc. Verify no such blocks in the end.
+    NotSet,
     /// This block returns to the call-site, remapping variables to the call-site.
     Callsite(VarRemapping),
+    /// This block ends with a jump to a different block.
+    Goto {
+        target: BlockId,
+        remapping: VarRemapping,
+    },
     /// This block ends with a `return` statement, exiting the function.
-    Return { refs: Vec<VariableId>, returns: Vec<VariableId> },
+    Return {
+        refs: Vec<VariableId>,
+        returns: Vec<VariableId>,
+    },
     /// This block ends with a `panic` statement, exiting the function.
-    Panic { refs: Vec<VariableId>, data: VariableId },
+    Panic {
+        refs: Vec<VariableId>,
+        data: VariableId,
+    },
     /// The last statement ended the flow (e.g., match will all arms ending in return),
     /// and the end of this block is unreachable.
     Unreachable,
@@ -120,6 +151,16 @@ pub struct FlatBlock {
     /// Describes how this block ends: returns to the caller or exits the function.
     pub end: FlatBlockEnd,
 }
+impl Default for FlatBlock {
+    fn default() -> Self {
+        Self {
+            inputs: Default::default(),
+            statements: Default::default(),
+            // TODO(Yg): change?
+            end: FlatBlockEnd::Unreachable,
+        }
+    }
+}
 
 /// Describes what happens to the program flow at the end of a [`FlatBlock`].
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -131,6 +172,8 @@ pub enum FlatBlockEnd {
     /// The last statement ended the flow (e.g., match will all arms ending in return),
     /// and the end of this block is unreachable.
     Unreachable,
+    // TODO(yg): doc.
+    NotSet,
 
     /// Fallthrough and Goto are currently only used when inlining functions.
     /// Fallthrough(BlockId, _) indicates that `BlockId` is the logical continuation of the
@@ -144,7 +187,7 @@ pub enum FlatBlockEnd {
 }
 
 impl TryFrom<StructuredBlock> for FlatBlock {
-    type Error = ();
+    type Error = String;
 
     fn try_from(value: StructuredBlock) -> Result<Self, Self::Error> {
         Ok(FlatBlock {
@@ -156,16 +199,20 @@ impl TryFrom<StructuredBlock> for FlatBlock {
 }
 
 impl TryFrom<StructuredBlockEnd> for FlatBlockEnd {
-    type Error = ();
+    type Error = String;
 
     fn try_from(value: StructuredBlockEnd) -> Result<Self, Self::Error> {
         Ok(match value {
             StructuredBlockEnd::Callsite(vars) => FlatBlockEnd::Callsite(vars),
+            StructuredBlockEnd::Goto { target, remapping } => FlatBlockEnd::Goto(target, remapping),
             StructuredBlockEnd::Return { refs, returns } => {
                 FlatBlockEnd::Return(chain!(refs.iter(), returns.iter()).copied().collect())
             }
-            StructuredBlockEnd::Panic { .. } => return Err(()),
+            StructuredBlockEnd::Panic { .. } => return Err("TODO(yg)".to_string()),
             StructuredBlockEnd::Unreachable => FlatBlockEnd::Unreachable,
+            StructuredBlockEnd::NotSet => {
+                return Err("Should not have blocks that are not yet set".to_string());
+            }
         })
     }
 }

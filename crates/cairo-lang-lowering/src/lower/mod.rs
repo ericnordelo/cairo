@@ -26,7 +26,10 @@ use crate::db::LoweringGroup;
 use crate::diagnostic::LoweringDiagnosticKind::*;
 use crate::lower::context::{LoweringContextBuilder, LoweringResult, VarRequest};
 use crate::lower::scope::merge_sealed;
-use crate::{Statement, StatementMatchEnum, StatementMatchExtern, StructuredLowered, VariableId};
+use crate::{
+    BlockId, Statement, StatementMatchEnum, StatementMatchExtern, StructuredBlock,
+    StructuredBlockEnd, StructuredLowered, VarRemapping, VariableId,
+};
 pub mod generators;
 
 pub mod context;
@@ -34,6 +37,21 @@ mod external;
 pub mod implicits;
 mod lower_if;
 mod scope;
+
+// TODO(yg): remove both, use from utils
+fn alloc_empty_block(ctx: &mut LoweringContext<'_>) -> BlockId {
+    ctx.blocks.alloc_empty(|id| StructuredBlock::new(id))
+}
+fn create_subscope(ctx: &mut LoweringContext<'_>, scope: &mut BlockBuilder) -> BlockBuilder {
+    scope.subscope(alloc_empty_block(ctx))
+}
+// TODO(yg): move utils, doc, remove mut from scope. rename
+fn create_subscope_with_bound_refs(
+    ctx: &mut LoweringContext<'_>,
+    scope: &mut BlockBuilder,
+) -> BlockBuilder {
+    scope.subscope_with_bound_refs(alloc_empty_block(ctx))
+}
 
 /// Lowers a semantic free function.
 pub fn lower(db: &dyn LoweringGroup, function_id: FunctionWithBodyId) -> Maybe<StructuredLowered> {
@@ -62,7 +80,8 @@ pub fn lower(db: &dyn LoweringGroup, function_id: FunctionWithBodyId) -> Maybe<S
         extract_matches!(&function_def.exprs[function_def.body_expr], semantic::Expr::Block);
 
     // Initialize scope.
-    let mut scope = BlockBuilder::root(&ctx);
+    let root_block_id = alloc_empty_block(&mut ctx);
+    let mut scope = BlockBuilder::root(&ctx, root_block_id);
     for ty in &implicits {
         let var = scope.add_input(&mut ctx, VarRequest { ty: *ty, location: signature_location });
         scope.put_implicit(&mut ctx, *ty, var);
@@ -92,11 +111,15 @@ pub fn lower(db: &dyn LoweringGroup, function_id: FunctionWithBodyId) -> Maybe<S
                 }
                 SealedBlockBuilder::Ends(block) => block,
             };
-            Ok(ctx.blocks.alloc(block))
+            let block_id = block.id;
+            ctx.blocks.set_block(block_id, block);
+            Ok(root_block_id)
         })
     } else {
         Err(DiagnosticAdded)
     };
+    // The last block might not be set, remove it to prevent test errors.
+    ctx.blocks.remove_unset_blocks(StructuredBlock::is_set);
     Ok(StructuredLowered {
         diagnostics: ctx.diagnostics.build(),
         root,
@@ -514,7 +537,7 @@ fn lower_expr_match(
     // Merge arm blocks.
     let sealed_blocks = zip_eq(&concrete_variants, &expr.arms)
         .map(|(concrete_variant, arm)| {
-            let mut subscope = scope.subscope_with_bound_refs();
+            let mut subscope = create_subscope_with_bound_refs(ctx, scope);
 
             // TODO(spapini): Make a better diagnostic.
             let enum_pattern = try_extract_matches!(&arm.pattern, semantic::Pattern::EnumVariant)
@@ -552,13 +575,22 @@ fn lower_expr_match(
             .map_err(LoweringFlowError::Failed)
         })
         .collect::<LoweringResult<_>>()?;
+
     let merged = merge_sealed(ctx, scope, sealed_blocks, location);
     let arms = zip_eq(concrete_variants, merged.blocks).collect();
+
+    // Emit the statement.
     scope.push_finalized_statement(Statement::MatchEnum(StatementMatchEnum {
         concrete_enum_id,
         input: expr_var,
         arms,
     }));
+
+    // After the merge, continue the rest of the code with a new subscope block.
+    if let Some(following_block) = merged.following_block {
+        scope.goto(ctx, following_block);
+    }
+
     merged.expr
 }
 
@@ -583,7 +615,7 @@ fn lower_optimized_extern_match(
     // Merge arm blocks.
     let sealed_blocks = zip_eq(&concrete_variants, match_arms)
         .map(|(concrete_variant, arm)| {
-            let mut subscope = scope.subscope();
+            let mut subscope = create_subscope(ctx, scope);
             let input_tys =
                 match_extern_variant_arm_input_types(ctx, concrete_variant.ty, &extern_enum);
             let mut input_vars = input_tys
@@ -634,6 +666,12 @@ fn lower_optimized_extern_match(
         inputs: extern_enum.inputs,
         arms,
     }));
+
+    // After the merge, continue the rest of the code with a new subscope block.
+    if let Some(following_block) = merged.following_block {
+        scope.goto(ctx, following_block);
+    }
+
     merged.expr
 }
 
@@ -675,20 +713,24 @@ fn lower_expr_match_felt(
 
     let semantic_db = ctx.db.upcast();
 
+    // TODO(yg): try using create_subscope_with_ref_bounds directly.
     // Lower both blocks.
-    let mut subscope_nz = scope.subscope_with_bound_refs();
+    let zero_block_id = alloc_empty_block(ctx);
+    let nonzero_block_id = alloc_empty_block(ctx);
+
+    let mut subscope_nz = scope.subscope_with_bound_refs(nonzero_block_id);
     subscope_nz.add_input(
         ctx,
         VarRequest { ty: core_nonzero_ty(semantic_db, core_felt_ty(semantic_db)), location },
     );
 
     let sealed_blocks = vec![
-        lower_tail_expr(ctx, scope.subscope_with_bound_refs(), *block0)
+        lower_tail_expr(ctx, scope.subscope_with_bound_refs(zero_block_id), *block0)
             .map_err(LoweringFlowError::Failed)?,
         lower_tail_expr(ctx, subscope_nz, *block_otherwise).map_err(LoweringFlowError::Failed)?,
     ];
-    let merged = merge_sealed(ctx, scope, sealed_blocks, location);
 
+    let merged = merge_sealed(ctx, scope, sealed_blocks, location);
     let concrete_variants =
         vec![jump_nz_zero_variant(ctx.db.upcast()), jump_nz_nonzero_variant(ctx.db.upcast())];
     let arms = zip_eq(concrete_variants, merged.blocks).collect();
@@ -699,6 +741,12 @@ fn lower_expr_match_felt(
         inputs: vec![expr_var],
         arms,
     }));
+
+    // After the merge, continue the rest of the code with a new subscope block.
+    if let Some(following_block) = merged.following_block {
+        scope.goto(ctx, following_block);
+    }
+
     merged.expr
 }
 
@@ -848,12 +896,12 @@ fn lower_expr_error_propagate(
 
     let var = lowered_expr.var(ctx, scope)?;
     // Ok arm.
-    let mut subscope_ok = scope.subscope_with_bound_refs();
+    let mut subscope_ok = create_subscope_with_bound_refs(ctx, scope);
     let expr_var = subscope_ok.add_input(ctx, VarRequest { ty: ok_variant.ty, location });
     let sealed_block_ok = subscope_ok.goto_callsite(Some(expr_var));
 
     // Err arm.
-    let mut subscope_err = scope.subscope_with_bound_refs();
+    let mut subscope_err = create_subscope_with_bound_refs(ctx, scope);
     let err_value = subscope_err.add_input(ctx, VarRequest { ty: err_variant.ty, location });
     let err_res =
         generators::EnumConstruct { input: err_value, variant: func_err_variant.clone(), location }
@@ -873,6 +921,12 @@ fn lower_expr_error_propagate(
         input: var,
         arms,
     }));
+
+    // After the merge, continue the rest of the code with a new subscope block.
+    if let Some(following_block) = merged.following_block {
+        scope.goto(ctx, following_block);
+    }
+
     merged.expr
 }
 
@@ -889,7 +943,7 @@ fn lower_optimized_extern_error_propagate(
     log::trace!("Started lowering of an optimized error-propagate expression.");
 
     // Ok arm.
-    let mut subscope_ok = scope.subscope();
+    let mut subscope_ok = create_subscope(ctx, scope);
     let input_tys = match_extern_variant_arm_input_types(ctx, ok_variant.ty, &extern_enum);
     let mut input_vars = input_tys
         .into_iter()
@@ -901,7 +955,7 @@ fn lower_optimized_extern_error_propagate(
     let sealed_block_ok = subscope_ok.goto_callsite(Some(expr));
 
     // Err arm.
-    let mut subscope_err = scope.subscope();
+    let mut subscope_err = create_subscope(ctx, scope);
     let input_tys = match_extern_variant_arm_input_types(ctx, err_variant.ty, &extern_enum);
     let mut input_vars = input_tys
         .into_iter()
@@ -920,12 +974,19 @@ fn lower_optimized_extern_error_propagate(
     let block_err = merged.blocks[1];
 
     let arms = vec![(ok_variant.clone(), block_ok), (err_variant.clone(), block_err)];
+
     // Emit the statement.
     scope.push_finalized_statement(Statement::MatchExtern(StatementMatchExtern {
         function: extern_enum.function,
         inputs: extern_enum.inputs,
         arms,
     }));
+
+    // After the merge, continue the rest of the code with a new subscope block.
+    if let Some(following_block) = merged.following_block {
+        scope.goto(ctx, following_block);
+    }
+
     merged.expr
 }
 

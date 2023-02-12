@@ -11,13 +11,14 @@ use crate::{
     VarRemapping, VariableId,
 };
 
+// TODO(yg): remove pubs?
 /// StructuredBlock builder, describing its current state.
 pub struct BlockBuilder {
     /// The variable ids currently bound to the ref variables.
     current_refs: Vec<Option<VariableId>>,
     /// The variable ids bound to the ref variables (including implicits) at the beginning of the
     /// block.
-    initial_refs: Option<Vec<VariableId>>,
+    pub initial_refs: Option<Vec<VariableId>>,
     /// Variables given as inputs to the block, including implicits. Relevant for function blocks /
     /// match arm blocks, etc...
     inputs: Vec<VariableId>,
@@ -37,10 +38,12 @@ pub struct BlockBuilder {
     /// update until exactly after next statement. When finalize_statement() will be called, these
     /// updates will be added to the statement.
     pending_ref_updates: OrderedHashMap<RefIndex, VariableId>,
+    /// The id to use for this block when it's finalized.
+    pub pending_block: BlockId,
 }
 impl BlockBuilder {
     /// Creates a new [BlockBuilder] for the root block of a function body.
-    pub fn root(ctx: &LoweringContext<'_>) -> Self {
+    pub fn root(ctx: &LoweringContext<'_>, block_id: BlockId) -> Self {
         BlockBuilder {
             current_refs: (0..(ctx.implicits.len() + ctx.ref_params.len())).map(|_| None).collect(),
             initial_refs: None,
@@ -52,11 +55,12 @@ impl BlockBuilder {
             statements: Default::default(),
             pending_statement: None,
             pending_ref_updates: Default::default(),
+            pending_block: block_id,
         }
     }
 
     /// Creates a [BlockBuilder] for a subscope.
-    pub fn subscope(&self) -> BlockBuilder {
+    pub fn subscope(&self, block_id: BlockId) -> BlockBuilder {
         BlockBuilder {
             current_refs: self.current_refs.clone(),
             initial_refs: None,
@@ -68,14 +72,34 @@ impl BlockBuilder {
             statements: Default::default(),
             pending_statement: None,
             pending_ref_updates: Default::default(),
+            pending_block: block_id,
         }
     }
 
     /// Creates a [BlockBuilder] for a subscope with unchanged refs.
-    pub fn subscope_with_bound_refs(&self) -> BlockBuilder {
-        let mut subscope = self.subscope();
+    pub fn subscope_with_bound_refs(&self, block_id: BlockId) -> BlockBuilder {
+        let mut subscope = self.subscope(block_id);
         subscope.bind_refs();
         subscope
+    }
+
+    pub fn sibling_scope(&self, block_id: BlockId) -> BlockBuilder {
+        // TODO(yg): should chnaged implicits/semantics be nonempty? Can this even work?
+        let mut scope = BlockBuilder {
+            current_refs: self.current_refs.clone(),
+            initial_refs: None,
+            inputs: self.inputs.clone(),
+            implicits: self.implicits.clone(),
+            changed_implicits: Default::default(),
+            semantics: self.semantics.clone(),
+            changed_semantics: Default::default(),
+            statements: Default::default(),
+            pending_statement: None,
+            pending_ref_updates: Default::default(),
+            pending_block: block_id,
+        };
+        scope.bind_refs();
+        scope
     }
 
     /// Adds an input to the block.
@@ -174,8 +198,8 @@ impl BlockBuilder {
     }
 
     /// Ends a block with Unreachable.
-    pub fn unreachable(self) -> StructuredBlock {
-        self.finalize(StructuredBlockEnd::Unreachable)
+    pub fn unreachable(self, ctx: &mut LoweringContext<'_>) -> StructuredBlock {
+        self.finalize(ctx, StructuredBlockEnd::Unreachable)
     }
 
     /// Ends a block with Panic.
@@ -194,10 +218,10 @@ impl BlockBuilder {
             .collect::<Option<Vec<_>>>()
             .to_maybe()?;
 
-        Ok(self.finalize(StructuredBlockEnd::Panic {
-            refs: chain!(implicit_vars, ref_vars).collect(),
-            data,
-        }))
+        Ok(self.finalize(
+            ctx,
+            StructuredBlockEnd::Panic { refs: chain!(implicit_vars, ref_vars).collect(), data },
+        ))
     }
 
     /// Ends a block with Callsite.
@@ -221,20 +245,42 @@ impl BlockBuilder {
             .collect::<Option<Vec<_>>>()
             .to_maybe()?;
 
-        Ok(self.finalize(StructuredBlockEnd::Return {
-            refs: chain!(implicit_vars, ref_vars).collect(),
-            returns: vec![expr],
-        }))
+        Ok(self.finalize(
+            ctx,
+            StructuredBlockEnd::Return {
+                refs: chain!(implicit_vars, ref_vars).collect(),
+                returns: vec![expr],
+            },
+        ))
     }
 
     /// Ends a block with known ending information. Used by [SealedBlockBuilder].
-    fn finalize(self, end: StructuredBlockEnd) -> StructuredBlock {
-        StructuredBlock {
+    pub fn finalize(
+        self,
+        ctx: &mut LoweringContext<'_>,
+        end: StructuredBlockEnd,
+    ) -> StructuredBlock {
+        let block = StructuredBlock {
             initial_refs: self.initial_refs.expect("References have not been bound yet."),
             inputs: self.inputs,
             statements: self.statements,
             end,
-        }
+            id: self.pending_block,
+        };
+        // ctx.blocks.set_block(block.id, block.clone());
+        block
+    }
+
+    pub fn goto(&mut self, ctx: &mut LoweringContext<'_>, target: BlockId) {
+        let block = StructuredBlock {
+            initial_refs: self.initial_refs.clone().expect("References have not been bound yet."),
+            inputs: self.inputs.clone(),
+            statements: self.statements.clone(),
+            end: StructuredBlockEnd::Goto { target, remapping: VarRemapping::default() },
+            id: self.pending_block,
+        };
+        ctx.blocks.set_block(block.id, block);
+        *self = self.sibling_scope(target);
     }
 }
 
@@ -250,15 +296,21 @@ pub struct SemanticRemapping {
 /// A sealed BlockBuilder, ready to be merged with sibling blocks to end the block.
 #[allow(clippy::large_enum_variant)]
 pub enum SealedBlockBuilder {
-    /// Block should end by goto callsite. expr may be None for blocks that return the unit type.
+    /// Block should end by goto callsite. `expr` may be None for blocks that return the unit type.
     GotoCallsite { scope: BlockBuilder, expr: Option<VariableId> },
     /// Block end is already known.
     Ends(StructuredBlock),
 }
 impl SealedBlockBuilder {
-    /// Given the extra information needed, returns the final StructuredBlock.
-    fn finalize(self, semantic_remapping: &SemanticRemapping) -> StructuredBlock {
-        match self {
+    // TODO(Yg): update doc.
+    /// Given the extra information needed, returns the ID of the final StructuredBlock.
+    fn finalize(
+        self,
+        ctx: &mut LoweringContext<'_>,
+        semantic_remapping: &SemanticRemapping,
+    ) -> BlockId {
+        println!("yg finalizing sealed block");
+        let block = match self {
             SealedBlockBuilder::GotoCallsite { scope, expr } => {
                 let mut remapping = VarRemapping::default();
                 // Since SemanticRemapping should have unique variable ids, these asserts will pass.
@@ -273,10 +325,14 @@ impl SealedBlockBuilder {
                     assert!(remapping.insert(remapped_var, expr).is_none());
                 }
 
-                scope.finalize(StructuredBlockEnd::Callsite(remapping))
+                scope.finalize(ctx, StructuredBlockEnd::Callsite(remapping))
             }
             SealedBlockBuilder::Ends(block) => block,
-        }
+        };
+        let block_id = block.id;
+        println!("yg finalizing sealed block id: {}", block_id.0);
+        ctx.blocks.set_block(block_id, block);
+        block_id
     }
 }
 impl From<StructuredBlock> for SealedBlockBuilder {
@@ -291,6 +347,7 @@ pub struct MergedBlocks {
     pub expr: LoweringResult<LoweredExpr>,
     /// Merged block ids.
     pub blocks: Vec<BlockId>,
+    pub following_block: Option<BlockId>,
 }
 
 /// Merges sibling sealed blocks.
@@ -339,13 +396,14 @@ pub fn merge_sealed(
         }
     }
 
-    let blocks = sealed_blocks
-        .into_iter()
-        .map(|s| {
-            let var = s.finalize(&semantic_remapping);
-            ctx.blocks.alloc(var)
-        })
-        .collect();
+    // If there are reachable blocks, create a new empty block for the code after this match.
+    let following_block = if n_reachable_blocks == 0 {
+        None
+    } else {
+        Some(ctx.blocks.alloc_empty(|id| StructuredBlock::new(id)))
+    };
+
+    let blocks = sealed_blocks.into_iter().map(|s| s.finalize(ctx, &semantic_remapping)).collect();
 
     // Apply remapping on scope.
     for (implicit, var) in semantic_remapping.implicits {
@@ -360,5 +418,5 @@ pub fn merge_sealed(
         Some(var) => Ok(LoweredExpr::AtVariable(var)),
         None => Ok(LoweredExpr::Tuple { exprs: vec![], location }),
     };
-    MergedBlocks { expr, blocks }
+    MergedBlocks { expr, blocks, following_block }
 }

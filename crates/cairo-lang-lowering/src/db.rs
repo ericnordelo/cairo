@@ -153,7 +153,8 @@ fn priv_function_with_body_lowered_flat(
 ) -> Maybe<Arc<FlatLowered>> {
     let structured = db.priv_function_with_body_lowered_structured(function_id)?;
     let mut lowered = lower_panics(db, function_id, &structured)?;
-    borrow_check(function_id.module_file_id(db.upcast()), &mut lowered);
+    // TODO(yg): re-enable.
+    // borrow_check(function_id.module_file_id(db.upcast()), &mut lowered);
     Ok(Arc::new(lowered))
 }
 

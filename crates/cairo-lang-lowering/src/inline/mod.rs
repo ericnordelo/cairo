@@ -113,8 +113,14 @@ fn gather_inlining_info(
                     return Ok(info);
                 }
             }
-            FlatBlockEnd::Callsite(_) | FlatBlockEnd::Fallthrough(..) | FlatBlockEnd::Goto(..) => {
+            // TODO(yg): check if this makes sense. If it does, consider uniting with return.
+            FlatBlockEnd::Goto(..) => {
+                println!("yg block_id: {}, end: goto", block_id.0);
+            }
+            FlatBlockEnd::NotSet => unreachable!(),
+            end @ (FlatBlockEnd::Callsite(_) | FlatBlockEnd::Fallthrough(..)) => {
                 if block_id == root_block_id {
+                    println!("yg block_id: {}, end: {end:?}", block_id.0);
                     panic!("Unexpected block end.");
                 }
             }
@@ -133,8 +139,8 @@ fn should_inline(_db: &dyn LoweringGroup, lowered: &FlatLowered) -> Maybe<bool> 
     let root_block = &lowered.blocks[root_block_id];
 
     match &root_block.end {
-        FlatBlockEnd::Return(_) | FlatBlockEnd::Unreachable => {}
-        FlatBlockEnd::Callsite(_) | FlatBlockEnd::Fallthrough(..) | FlatBlockEnd::Goto(..) => {
+        FlatBlockEnd::Return(_) | FlatBlockEnd::Unreachable | FlatBlockEnd::Goto(..) => {}
+        FlatBlockEnd::Callsite(_) | FlatBlockEnd::Fallthrough(..) | FlatBlockEnd::NotSet => {
             panic!("Unexpected block end.");
         }
     };
@@ -500,6 +506,7 @@ impl<'db> FunctionInlinerRewriter<'db> {
                     mapper.renamed_blocks[block_id],
                     mapper.update_remapping(remapping),
                 ),
+                FlatBlockEnd::NotSet => unreachable!(),
             };
 
             let inputs = block.inputs.iter().map(|v| mapper.rename_var(v)).collect();

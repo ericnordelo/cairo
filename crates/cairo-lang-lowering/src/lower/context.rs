@@ -20,7 +20,7 @@ use crate::db::LoweringGroup;
 use crate::diagnostic::LoweringDiagnostics;
 use crate::lower::external::{extern_facade_expr, extern_facade_return_tys};
 use crate::objects::Variable;
-use crate::{Statement, StatementMatchExtern, VariableId};
+use crate::{Statement, StatementMatchExtern, StructuredBlock, VariableId};
 
 /// Builds a Lowering context.
 pub struct LoweringContextBuilder<'db> {
@@ -199,7 +199,8 @@ impl LoweredExprExternEnum {
             .clone()
             .into_iter()
             .map(|concrete_variant| {
-                let mut subscope = scope.subscope();
+                let mut subscope =
+                    scope.subscope(ctx.blocks.alloc_empty(|id| StructuredBlock::new(id)));
 
                 // Bind implicits.
                 for ty in &self.implicits {
@@ -244,12 +245,19 @@ impl LoweredExprExternEnum {
 
         let merged = merge_sealed(ctx, scope, sealed_blocks, self.location);
         let arms = zip_eq(concrete_variants, merged.blocks).collect();
+
         // Emit the statement.
         scope.push_finalized_statement(Statement::MatchExtern(StatementMatchExtern {
             function: self.function,
             inputs: self.inputs,
             arms,
         }));
+
+        // After the merge, continue the rest of the code with a new subscope block.
+        if let Some(following_block) = merged.following_block {
+            scope.goto(ctx, following_block);
+        }
+
         merged.expr?.var(ctx, scope)
     }
 }
@@ -286,7 +294,7 @@ pub fn lowering_flow_error_to_sealed_block(
 ) -> Maybe<SealedBlockBuilder> {
     match err {
         LoweringFlowError::Failed(diag_added) => Err(diag_added),
-        LoweringFlowError::Unreachable => Ok(scope.unreachable().into()),
+        LoweringFlowError::Unreachable => Ok(scope.unreachable(ctx).into()),
         LoweringFlowError::Return(return_var) => Ok(scope.ret(ctx, return_var)?.into()),
         LoweringFlowError::Panic(data_var) => Ok(scope.panic(ctx, data_var)?.into()),
     }
